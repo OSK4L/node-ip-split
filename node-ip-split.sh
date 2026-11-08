@@ -7,7 +7,12 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 umask 077
 
 die() { printf '\nОСТАНОВКА: %s\n' "$*" >&2; exit 1; }
-ask() { local value; read -r -p "$2" value; printf -v "$1" '%s' "$value"; }
+ask() {
+    local value
+    printf '%s' "$2" > /dev/tty
+    IFS= read -r value < /dev/tty || die 'Ввод прерван.'
+    printf -v "$1" '%s' "$value"
+}
 ipv4() { python3 -c 'import ipaddress,sys; a=ipaddress.IPv4Address(sys.argv[1]); assert a.is_global and not a.is_multicast and not a.is_reserved' "$1" 2>/dev/null; }
 ports() {
     python3 - "$1" <<'PY'
@@ -96,11 +101,14 @@ if [[ ${1:-} == --help ]]; then
       'Только простой IPv4, два локальных публичных адреса, Docker host network.' \
       'WARP, policy routing, сторонний NAT и firewall managers: аудит и остановка.' \
       'Отключение: sudo bash node-ip-split.sh --disable (SSH_CONNECTION не требуется).' \
+      'Поддерживается curl URL | sudo --preserve-env=SSH_CONNECTION bash; ввод через /dev/tty.' \
       'Без аргументов: меню настройки или отключения. --setup: сразу настройка.'
     exit 0
 fi
 [[ $EUID == 0 ]] || die 'Нужен root на VPS.'
-[[ -t 0 ]] || die 'Нужен интерактивный терминал; не используйте curl | bash.'
+if ! ( : < /dev/tty > /dev/tty ) 2>/dev/null; then
+    die 'Нужен терминал: запустите из интерактивной SSH-сессии.'
+fi
 MODE=${1:-}
 if [[ -z $MODE ]]; then
     printf '%s\n' '1 — аудит и настройка разделения IP' '2 — отключить разделение IP и удалить добавленные правила' '0 — выход'
