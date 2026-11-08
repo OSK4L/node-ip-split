@@ -19,15 +19,99 @@ assert all(x.strip().isdigit() and 1<=int(x)<=65535 for x in a), 'Порты: ч
 print(', '.join(str(x) for x in sorted(set(map(int,a)))))
 PY
 }
+disable_split() {
+    local target='' remove_ufw='' confirm='' backup unit
+    for bin in python3 nft systemctl flock tar; do
+        command -v "$bin" >/dev/null || die "Для отключения нужна команда $bin."
+    done
+    [[ -d /run/systemd/system ]] || die 'Нужен systemd.'
+    exec 9>/run/node-ip-split.lock
+    flock -n 9 || die 'Сначала завершите другой запущенный экземпляр скрипта.'
+    # Confirm netlink access before treating an absent table as an uninstalled setup.
+    nft list tables >/dev/null
+    printf '%s\n' 'Будут удалены только таблица ip node_ip_split и автозапуск node-ip-split.' \
+      'Панель, DNS, адреса, маршруты, WARP и остальные таблицы firewall не изменяются.' \
+      'Резервные копии предыдущих запусков сохранятся.'
+    if command -v ufw >/dev/null; then
+        ufw status numbered
+        ask remove_ufw 'Удалить также добавленный вручную запрет UFW для выходного IPv4:443/TCP? [да/нет]: '
+        if [[ $remove_ufw == да ]]; then
+            ask target 'Выходной IPv4, для которого добавляли запрет (например 185.252.177.114): '
+            ipv4 "$target" || die 'Некорректный публичный IPv4.'
+            printf 'Будет выполнено: ufw --force delete deny in proto tcp from any to %s port 443\n' "$target"
+            printf '%s\n' 'У ручного правила нет метки владельца: подтвердите, что это именно добавленный нами запрет.'
+        fi
+    fi
+    printf '%s\n' 'После удаления ограничений выходной IP снова сможет принимать подключения, если остальные правила разрешают.' \
+      'После удаления SNAT новые соединения используют обычные настройки системы.' \
+      'Уже установленные NAT-соединения могут сохранять адрес до переподключения; conntrack не очищается.'
+    ask confirm 'Введите ОТКЛЮЧИТЬ для выполнения; Enter — отмена: '
+    [[ $confirm == ОТКЛЮЧИТЬ ]] || { echo 'Отменено, изменений нет.'; return; }
+    backup=$(mktemp -d /root/node-ip-split-disable-XXXXXXXX)
+    nft list ruleset > "$backup/nft.before.txt"
+    local files=()
+    for unit in /etc/node-ip-split /etc/systemd/system/node-ip-split.service /etc/ufw; do
+        [[ ! -e $unit ]] || files+=("${unit#/}")
+    done
+    if ((${#files[@]})); then tar -C / -czf "$backup/config.before.tar.gz" "${files[@]}"; fi
+    printf 'Резервная копия перед отключением: %s\n' "$backup"
+    # Stop watchdogs before taking their lock; a watchdog may already be running.
+    systemctl list-units --all --plain --no-legend 'node-ip-split-rollback-*' > "$backup/watchdogs.before.txt"
+    while read -r unit _; do
+        [[ $unit =~ ^node-ip-split-rollback-[0-9]+-[0-9]+\.(timer|service)$ ]] || continue
+        systemctl stop "$unit"
+    done < "$backup/watchdogs.before.txt"
+    exec 8>/run/node-ip-split-change.lock
+    flock -x 8
+    if [[ -e /etc/systemd/system/node-ip-split.service ]]; then
+        systemctl disable --now node-ip-split.service
+    fi
+    if nft list table ip node_ip_split >/dev/null 2>&1; then
+        nft delete table ip node_ip_split
+    fi
+    rm -f /etc/systemd/system/node-ip-split.service
+    rm -f /etc/node-ip-split/rules.nft /etc/node-ip-split/apply.sh /etc/node-ip-split/committed
+    if [[ -d /etc/node-ip-split ]]; then
+        rmdir /etc/node-ip-split 2>/dev/null || printf '%s\n' 'В /etc/node-ip-split остались дополнительные файлы; они сохранены.'
+    fi
+    systemctl daemon-reload
+    if [[ $remove_ufw == да ]]; then
+        ufw --force delete deny in proto tcp from any to "$target" port 443
+        ufw status numbered | tee "$backup/ufw.after.txt"
+    fi
+    nft list tables > "$backup/tables.after.txt"
+    if nft list table ip node_ip_split >/dev/null 2>&1; then die 'Таблица осталась; отключение не завершено.'; fi
+    [[ ! -e /etc/systemd/system/node-ip-split.service ]] || die 'Файл службы остался.'
+    flock -u 8
+    printf '%s\n' 'Отключено: таблица node_ip_split удалена/отсутствует, файл автозапуска удалён/отсутствует.' \
+      'Сеть и сервер не перезапускались. Внешняя доступность портов этим скриптом не проверялась.' | tee "$backup/result.txt"
+    if [[ $remove_ufw == да ]]; then
+        printf 'Запрошено удаление точного запрета UFW для %s:443/TCP; итоговые правила в ufw.after.txt.\n' "$target" | tee -a "$backup/result.txt"
+    fi
+}
+
 if [[ ${1:-} == --help ]]; then
     printf '%s\n' 'Запуск на VPS: sudo --preserve-env=SSH_CONNECTION bash node-ip-split.sh' \
       'По умолчанию только аудит. Применение требует отдельного подтверждения.' \
       'Только простой IPv4, два локальных публичных адреса, Docker host network.' \
-      'WARP, policy routing, сторонний NAT и firewall managers: аудит и остановка.'
+      'WARP, policy routing, сторонний NAT и firewall managers: аудит и остановка.' \
+      'Отключение: sudo bash node-ip-split.sh --disable (SSH_CONNECTION не требуется).' \
+      'Без аргументов: меню настройки или отключения. --setup: сразу настройка.'
     exit 0
 fi
 [[ $EUID == 0 ]] || die 'Нужен root на VPS.'
 [[ -t 0 ]] || die 'Нужен интерактивный терминал; не используйте curl | bash.'
+MODE=${1:-}
+if [[ -z $MODE ]]; then
+    printf '%s\n' '1 — аудит и настройка разделения IP' '2 — отключить разделение IP и удалить добавленные правила' '0 — выход'
+    ask CHOICE 'Выберите действие [0]: '
+    case $CHOICE in 1) MODE=--setup ;; 2) MODE=--disable ;; ''|0) exit 0 ;; *) die 'Неизвестный пункт.' ;; esac
+fi
+case $MODE in
+    --disable) disable_split; exit 0 ;;
+    --setup) ;;
+    *) die 'Допустимые аргументы: --setup, --disable, --help.' ;;
+esac
 for bin in python3 ip ss nft iptables-save systemctl systemd-run curl flock tar; do
     command -v "$bin" >/dev/null || die "Не найдена $bin. Установите соответствующий пакет отдельно и повторите."
 done
