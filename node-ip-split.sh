@@ -6,14 +6,65 @@ set -Eeuo pipefail
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 umask 077
 
-die() { printf '\nОСТАНОВКА: %s\n' "$*" >&2; exit 1; }
+C_RESET='' C_BLUE='' C_GREEN='' C_YELLOW='' C_RED=''
+if [[ -t 1 && ${TERM:-dumb} != dumb && -z ${NO_COLOR:-} ]]; then
+    C_RESET=$'\033[0m'; C_BLUE=$'\033[1;36m'; C_GREEN=$'\033[1;32m'
+    C_YELLOW=$'\033[1;33m'; C_RED=$'\033[1;31m'
+fi
+title() { printf '\n%s%s%s\n' "$C_BLUE" "$*" "$C_RESET"; }
+warn() { printf '%sВнимание: %s%s\n' "$C_YELLOW" "$*" "$C_RESET"; }
+ok() { printf '%s%s%s\n' "$C_GREEN" "$*" "$C_RESET"; }
+die() { printf '\n%sНе выполнено: %s%s\n' "$C_RED" "$*" "$C_RESET" >&2; exit 1; }
 ask() {
     local value
-    printf '%s' "$2" > /dev/tty
+    printf '%s%s%s' "$C_BLUE" "$2" "$C_RESET" > /dev/tty
     IFS= read -r value < /dev/tty || die 'Ввод прерван.'
     printf -v "$1" '%s' "$value"
 }
 ipv4() { python3 -c 'import ipaddress,sys; a=ipaddress.IPv4Address(sys.argv[1]); assert a.is_global and not a.is_multicast and not a.is_reserved' "$1" 2>/dev/null; }
+ask_ip() {
+    local answer
+    while true; do
+        ask answer "$2"
+        if ipv4 "$answer"; then printf -v "$1" '%s' "$answer"; return; fi
+        warn 'Введите публичный IPv4, например 95.85.249.171. Ctrl+C — выход.'
+    done
+}
+show_status() {
+    title 'Текущая настройка'
+    python3 - <<'UI_PY'
+import json,os,subprocess
+from pathlib import Path
+p=Path('/var/lib/node-ip-split/state.json')
+if p.exists():
+    s=json.loads(p.read_text())
+    names={'active':'включено','planned':'не завершено','disabled':'выключено','adopted':'найдены старые правила'}
+    print('  Скрипт:     '+names.get(s.get('status'),'неизвестное состояние'))
+    print('  Входной IP: '+str(s.get('entry') or 'не записан'))
+    print('  Выходной IP:'+(' '+str(s.get('exit')) if s.get('exit') else ' не записан'))
+    print('  Это сохранённые настройки, не проверка VPN.')
+else:
+    print('  Скрипт:     ещё не настроен')
+    print('  Входной IP: не задан')
+    print('  Выходной IP: не задан')
+ssh=os.environ.get('SSH_CONNECTION','').split()
+if len(ssh)==4: print('  Этот SSH:   '+ssh[2]+':'+ssh[3])
+try:
+    r=subprocess.run(['ip','-j','-4','route','get','1.1.1.1'],capture_output=True,text=True,check=True)
+    v=json.loads(r.stdout)[0]
+    print('  IP по маршруту: '+str(v.get('prefsrc',v.get('src','не определён'))))
+    print('  Внешний IP сайта может отличаться (NAT/WARP).')
+except (OSError,ValueError,IndexError,subprocess.CalledProcessError):
+    print('  IP по маршруту: не удалось определить')
+UI_PY
+}
+show_plan() {
+    show_status
+    title 'Будет настроено'
+    printf '  Входной IP:  %s — сюда подключаются клиенты\n' "$ENTRY"
+    printf '  Выходной IP: %s — его должны видеть сайты\n' "$EXIT_IP"
+    printf '  VPN-порты: TCP [%s]  UDP [%s]\n' "${TCP_PORTS:--}" "${UDP_PORTS:--}"
+}
 ports() {
     python3 - "$1" <<'PY'
 import sys
@@ -119,8 +170,10 @@ def discover():
     return s
 
 def summary(s):
-    print('Статус журнала:', s['status'])
-    print(s.get('note',''))
+    labels={'active':'включено','planned':'настройка не завершена','disabled':'выключено','adopted':'старые правила','legacy-candidates':'старые правила — нужна проверка'}
+    print('Состояние:', labels.get(s['status'],s['status']))
+    if s.get('entry'): print('Входной IP:',s['entry'])
+    if s.get('exit'): print('Выходной IP:',s['exit'])
     for p in s['files']: print('Файл:',p)
     if s['nft'] is not None: print('Таблица: ip node_ip_split')
     for r in s['ufw']: print('UFW:',shlex.join(r))
@@ -258,7 +311,7 @@ disable_split() {
     flock -x 8
     prepare_state_tool
     backup=$(mktemp -d /root/node-ip-split-disable-XXXXXXXX)
-    nft list ruleset > "$backup/nft.before.txt"
+    nft list ruleset > "$backup/nft.before.txt" 2> "$backup/nft.log"
     local files=()
     for item in /etc/node-ip-split /etc/systemd/system/node-ip-split.service /etc/ufw /var/lib/node-ip-split; do
         [[ ! -e $item ]] || files+=("${item#/}")
@@ -272,12 +325,12 @@ disable_split() {
             continue_setup
             return
         fi
-        printf '%s\n' 'Нет журнала. Найдены КАНДИДАТЫ, а не доказанно собственные правила:'
+        title 'Найдены старые настройки'
         cat "$backup/discovery.txt"
-        printf '%s\n' 'Импорт допустим, только если ВСЕ перечисленные файлы и правила добавлены нами.' \
-          'Если есть посторонние объекты — отмените. По одному IP определить владельца нельзя.'
-        ask confirm 'Введите ИМПОРТИРОВАТЬ для однократной регистрации этих объектов или Enter для отмены: '
-        [[ $confirm == ИМПОРТИРОВАТЬ ]] || { echo 'Отменено. Сеть не изменена.'; return; }
+        show_status
+        warn 'Старые правила не имеют метки. Подтвердите, только если весь список добавлен этим скриптом или по нашей инструкции.'
+        ask confirm '1 — это наши настройки, Enter — отменить: '
+        [[ $confirm == 1 || $confirm == ИМПОРТИРОВАТЬ ]] || { echo 'Отменено. Сеть не изменена.'; return; }
         state_tool import "$backup/legacy-candidates.json"
     fi
     count=$(state_tool count)
@@ -294,16 +347,16 @@ disable_split() {
         continue_setup
         return
     fi
+    show_status
+    title 'Будет удалено'
     state_tool status
-    printf '%s\n' 'Удаляются только объекты из журнала, совпадающие с сохранённым состоянием.' \
-      'Маршруты (включая вручную выбранный src), IP, DNS и WARP не откатываются.' \
-      'Удаление запрета снова откроет порт, если остальные правила разрешают.' \
-      'Текущие NAT-соединения могут сохранять адрес до переподключения.'
-    ask confirm 'Введите ОТКЛЮЧИТЬ для удаления зарегистрированных изменений или Enter для отмены: '
-    [[ $confirm == ОТКЛЮЧИТЬ ]] || { echo 'Отменено. Сеть не изменена.'; return; }
+    warn 'Ограниченные скриптом порты снова смогут принимать подключения.'
+    printf '%s\n' 'Удаляем только записанные настройки скрипта. Адреса, маршруты, DNS и WARP сохраняем.'
+    ask confirm '1 — удалить, Enter — отменить: '
+    [[ $confirm == 1 || $confirm == ОТКЛЮЧИТЬ ]] || { echo 'Отменено. Сеть не изменена.'; return; }
     state_tool disable | tee "$backup/result.txt"
     nft list tables > "$backup/tables.after.txt"
-    if command -v ufw >/dev/null; then ufw status numbered | tee "$backup/ufw.after.txt"; fi
+    if command -v ufw >/dev/null; then ufw status numbered > "$backup/ufw.after.txt"; fi
     printf '%s\n' 'Журнал остаётся в /var/lib/node-ip-split/state.json; повторное отключение безопасно.'
 }
 
@@ -324,9 +377,26 @@ if ! ( : < /dev/tty > /dev/tty ) 2>/dev/null; then
 fi
 MODE=${1:-}
 if [[ -z $MODE ]]; then
-    printf '%s\n' '1 — аудит и настройка разделения IP' '2 — отключить разделение IP и удалить добавленные правила' '0 — выход'
-    ask CHOICE 'Выберите действие [0]: '
-    case $CHOICE in 1) MODE=--setup ;; 2) MODE=--disable ;; ''|0) exit 0 ;; *) die 'Неизвестный пункт.' ;; esac
+    command -v python3 >/dev/null || die 'Нужен python3.'
+    while true; do
+        title 'Разделение IP'
+        printf '%s\n' 'Вход — адрес подключения к VPN. Выход — адрес для сайтов.'
+        show_status
+        printf '%s\n' '  1  Настроить вход и выход' '  2  Посмотреть подробности' '  3  Удалить настройки скрипта' '  0  Выйти'
+        ask CHOICE 'Выберите номер [0]: '
+        case $CHOICE in
+            1) MODE=--setup; break ;;
+            2)
+                title 'Подробности'
+                prepare_state_tool
+                state_tool status
+                ask PAUSE 'Enter — вернуться в меню: '
+                ;;
+            3) MODE=--disable; break ;;
+            ''|0) exit 0 ;;
+            *) warn 'Выберите 1, 2, 3 или 0.' ;;
+        esac
+    done
 fi
 NEXT_ACTION=''
 case $MODE in
@@ -335,7 +405,7 @@ case $MODE in
         [[ $NEXT_ACTION == setup ]] || exit 0
         MODE=--setup
         ;;
-    --status) prepare_state_tool; state_tool status; exit 0 ;;
+    --status) show_status; prepare_state_tool; state_tool status; exit 0 ;;
     --setup) ;;
     *) die 'Допустимые аргументы: --setup, --disable, --status, --help.' ;;
 esac
@@ -346,27 +416,32 @@ done
 exec 9>/run/node-ip-split.lock
 flock -n 9 || die 'Уже запущен другой экземпляр.'
 
-printf '\nНастройка выполняется на %s. Сначала только аудит.\n' "$(hostname)"
-printf '%s\n' 'Никаких изменений панели/DNS, перезапуска сети или сервера.'
-ask ENTRY 'Входной публичный IPv4: '
-ask EXIT_IP 'Выходной публичный IPv4: '
+title 'Шаг 1 из 3 — адреса'
+show_status
+printf '%s\n' 'Сначала проверка. До подтверждения настройки сети не меняются.'
+ask_ip ENTRY 'Входной IP — адрес подключения к VPN: '
+ask_ip EXIT_IP 'Выходной IP — адрес для сайтов: '
 ipv4 "$ENTRY" && ipv4 "$EXIT_IP" || die 'Нужны два корректных публичных IPv4.'
 [[ $ENTRY != "$EXIT_IP" ]] || die 'Адреса должны различаться.'
-ask SSH_PORT 'SSH-порт текущего подключения [22]: '
-SSH_PORT=${SSH_PORT:-22}
+SSH_DEFAULT=${SSH_CONNECTION:-}
+SSH_DEFAULT=${SSH_DEFAULT##* }
+[[ $SSH_DEFAULT =~ ^[0-9]+$ ]] || SSH_DEFAULT=22
+ask SSH_PORT "SSH-порт [$SSH_DEFAULT]: "
+SSH_PORT=${SSH_PORT:-$SSH_DEFAULT}
 [[ $SSH_PORT =~ ^[0-9]{1,5}$ ]] && ((10#$SSH_PORT > 0 && 10#$SSH_PORT <= 65535)) || die 'Некорректный SSH-порт.'
 SSH_PORT=$((10#$SSH_PORT))
-[[ -n ${SSH_CONNECTION:-} ]] || die 'Нет SSH_CONNECTION. Подключитесь к VPS по SSH; при sudo сохраните эту переменную.'
+[[ -n ${SSH_CONNECTION:-} ]] || die 'Не вижу данные SSH. Выйдите из su - командой exit и запустите через sudo --preserve-env=SSH_CONNECTION.'
 read -r CLIENT CLIENT_PORT SERVER SERVER_PORT <<< "$SSH_CONNECTION"
 [[ $SERVER == "$ENTRY" && $SERVER_PORT == "$SSH_PORT" ]] || die 'Текущая SSH-сессия должна быть подключена к входному IP и указанному порту.'
 
+title 'Шаг 2 из 3 — проверка сервера'
 RUN=$(mktemp -d /root/node-ip-split-XXXXXXXX)
 printf '\nОтчёт и резервные копии: %s\n' "$RUN"
 ip -j -4 addr show > "$RUN/addresses.json"
 ip -j -4 route show table all > "$RUN/routes.json"
 ip -j -4 rule show > "$RUN/rules.json"
-nft -j list ruleset > "$RUN/nft.json"
-nft list ruleset > "$RUN/nft.before.txt"
+nft -j list ruleset > "$RUN/nft.json" 2> "$RUN/nft-json.log"
+nft list ruleset > "$RUN/nft.before.txt" 2> "$RUN/nft.log"
 iptables-save > "$RUN/iptables.before.txt"
 ss -lntup > "$RUN/listeners.txt"
 systemctl list-units --type=service --state=running --no-pager > "$RUN/services.txt"
@@ -380,14 +455,12 @@ for p in /etc/netplan /etc/network /etc/systemd/network /etc/NetworkManager/syst
     [[ ! -e $p ]] || BACKUP_PATHS+=("${p#/}")
 done
 if ((${#BACKUP_PATHS[@]})); then tar -C / -czf "$RUN/network-backup.tar.gz" "${BACKUP_PATHS[@]}"; fi
-printf '%s\n' '=== Слушающие порты ==='
-cat "$RUN/listeners.txt"
-printf '%s\n' '=== Маршруты ==='
-ip -4 route show
+printf '%s\n' 'Снимок сети сохранён. Проверяем VPN.'
 if command -v docker >/dev/null; then
     docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Ports}}' | tee "$RUN/docker.txt"
 fi
-ask NODE 'Имя Docker-контейнера VPN-ноды (или - если VPN отсутствует): '
+ask NODE 'Контейнер VPN [remnanode], либо - если VPN нет: '
+NODE=${NODE:-remnanode}
 NODE_MODE=none
 if [[ $NODE != - ]]; then
     [[ $NODE =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || die 'Некорректное имя контейнера.'
@@ -397,8 +470,9 @@ if [[ $NODE != - ]]; then
 fi
 TCP_PORTS='' UDP_PORTS=''
 if [[ $NODE != - ]]; then
-    printf '%s\n' 'Укажите только публичные VPN-порты ноды, не порт API Remnawave, SSH или панели.'
-    printf '%s\n' 'Если VPN делит порт с панелью/сайтом, автоматическое ограничение такого порта не подходит.'
+    printf '%s\n' 'Укажите внешние порты VPN. Если UDP-входа нет, введите -.'
+    warn 'Если этот порт нужен сайту или панели на выходном IP, не применяйте ограничение.'
+    awk '$1 == "tcp" && /LISTEN/ {print "  TCP " $5}' "$RUN/listeners.txt"
     ask RAW_TCP 'TCP-порты VPN через запятую (или -): '
     ask RAW_UDP 'UDP-порты VPN через запятую (или -): '
     TCP_PORTS=$(ports "$RAW_TCP") || die 'Неверные TCP-порты.'
@@ -493,9 +567,9 @@ probe() {
 }
 probe "$ENTRY" || die 'Входной IP не прошёл проверку исходящей связности.'
 probe "$EXIT_IP" || die 'Выходной IP не прошёл проверку исходящей связности.'
-printf '%s\n' 'Оба IP работают как источники HTTPS. Это не подтверждает все маршруты провайдера или доступность VPN извне.'
+ok 'Оба IP прошли проверку выхода в интернет.'
 printf '%s\n' 'Скрипт не назначает адреса и не переписывает netplan: оба IP должны быть постоянными уже сейчас.'
-ask PERSIST 'Оба IP настроены постоянно у хостера/в сетевой конфигурации, а не временным ip addr add? [да/нет]: '
+ask PERSIST 'Оба IP сохранятся после перезагрузки? [да/нет]: '
 [[ $PERSIST == да ]] || die 'Сначала нужно отдельно обеспечить постоянство обоих IP по инструкции провайдера.'
 
 cat > "$RUN/rules.nft" <<EOF
@@ -517,17 +591,15 @@ if [[ -n $UDP_PORTS ]]; then
     echo "add rule ip node_ip_split inbound ip daddr $EXIT_IP ct state new udp dport { $UDP_PORTS } counter reject" >> "$RUN/rules.nft"
 fi
 nft -c -f "$RUN/rules.nft" || die 'Проверка nftables не пройдена.'
-printf '\nПлан: новые обычные IPv4-соединения хоста и host-network ноды → %s.\n' "$EXIT_IP"
-printf 'Новые VPN-подключения к %s на TCP [%s], UDP [%s] будут отклоняться.\n' "$EXIT_IP" "$TCP_PORTS" "$UDP_PORTS"
-printf '%s\n' 'Установленные соединения и ответы клиентам сохраняют прежнюю conntrack-привязку.' \
-  'После отката уже созданные NAT-соединения могут сохранять IP до переподключения.' \
-  'IPv6, bridge-контейнеры, частные сети и отмеченный трафик не перенастраиваются.' \
-  'При ошибке — откат. Через 10 минут без подтверждения — автоматический откат.' \
-  'Второе НОВОЕ SSH-подключение обязательно для сохранения изменений.' \
-  'Если порт разделён с панелью/сайтом, не применяйте план.'
-cat "$RUN/rules.nft"
-ask APPLY 'Введите ПРИМЕНИТЬ для выполнения; Enter — закончить только аудитом: '
-[[ $APPLY == ПРИМЕНИТЬ ]] || { printf 'Только аудит: %s\n' "$RUN"; exit 0; }
+title 'Шаг 3 из 3 — подтверждение'
+show_plan
+warn 'На выходном IP новые подключения к указанным VPN-портам будут закрыты.'
+printf '%s\n' 'Новые обычные соединения IPv4 пойдут через выходной IP.' \
+  'Панель, DNS, IPv6 и сеть не перезапускаются. Старые соединения могут сохранить прежний IP.' \
+  'Через 10 минут изменения отменятся, если вы не проверите новый SSH-вход и не сохраните их.'
+printf 'Полные правила: %s/rules.nft\n' "$RUN"
+ask APPLY '1 — применить, Enter — отменить: '
+[[ $APPLY == 1 || $APPLY == ПРИМЕНИТЬ ]] || { printf 'Настройки не изменены. Отчёт: %s\n' "$RUN"; exit 0; }
 
 NFT=$(command -v nft)
 TIMER="node-ip-split-rollback-$(date +%s)-$$"
@@ -613,8 +685,10 @@ printf 'В новой сессии выполните: bash %s/verify-ssh.sh\n' 
 printf '%s\n' 'Также переподключите VPN к входному IP и проверьте внешний IPv4 в браузере.' \
   'Проверьте, что VPN к выходному IP не подключается. UDP проверяется реальным VPN-клиентом.' \
   'Скрипт не может автоматически проверить внешнюю доступность портов и полный VPN-путь.'
-ask KEEP 'После проверок введите СОХРАНИТЬ (до истечения 10 минут); иначе Enter для отката: '
-[[ $KEEP == СОХРАНИТЬ && -f $RUN/ssh-verified ]] || die 'Нет подтверждения или нового SSH-подключения.'
+show_plan
+warn 'Сохраняйте только после проверки нового SSH-подключения и VPN.'
+ask KEEP '1 — сохранить после проверок, Enter — вернуть прежние настройки: '
+[[ ( $KEEP == 1 || $KEEP == СОХРАНИТЬ ) && -f $RUN/ssh-verified ]] || die 'Нет подтверждения или нового SSH-подключения.'
 [[ ! -f $RUN/rolled-back ]] || die 'Таймер уже выполнил откат.'
 # Stop the watchdog before committing, and detect a concurrently started rollback.
 exec 8>/run/node-ip-split-change.lock
@@ -643,13 +717,8 @@ Netplan/панель/DNS не изменены. Архив: network-backup.tar.g
 НЕ проверены автоматически: VPN-клиент, доступность портов извне, реальная перезагрузка.
 Постоянство обоих адресов подтверждено оператором, не доказано скриптом.
 EOF
-printf '\nСохранено. Отчёт/резервные копии: %s\n' "$RUN"
-printf 'Ручной откат: bash %s/rollback.sh\n' "$RUN"
-printf '%s\n' 'Созданы: /etc/node-ip-split/{rules.nft,apply.sh,committed}, /etc/systemd/system/node-ip-split.service.' \
-  'Добавлена только собственная nft-таблица ip node_ip_split. Netplan, панель и DNS не менялись.' \
-  'Проверены: исходящий IPv4, новое SSH-соединение, синтаксис nft, включение systemd unit.' \
-  'Реальная перезагрузка и проверка VPN-клиентом скриптом НЕ выполнялись.' \
-  'Постоянство адресов у провайдера/в netplan требует проверки: скрипт не назначает IP заново.' \
-  'Журнал изменений: /var/lib/node-ip-split/state.json.' \
-  'Сторонний flush ruleset удалит правила: после него потребуется systemctl restart node-ip-split.' \
-  'Архив network-backup.tar.gz может содержать сетевые секреты; не публикуйте его.'
+ok 'Настройки сохранены.'
+printf 'Вход: %s   Выход: %s\n' "$ENTRY" "$EXIT_IP"
+printf 'Отчёт и резервные копии: %s\n' "$RUN"
+printf 'Вернуть прежние настройки: bash %s/rollback.sh\n' "$RUN"
+printf '%s\n' 'Автозапуск включён. Реальная перезагрузка и VPN-клиент скриптом не проверялись.'
