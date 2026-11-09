@@ -18,7 +18,11 @@ die() { printf '\n%sНе выполнено: %s%s\n' "$C_RED" "$*" "$C_RESET" >&
 ask() {
     local value
     printf '%s%s%s' "$C_BLUE" "$2" "$C_RESET" > /dev/tty
-    IFS= read -r value < /dev/tty || die 'Ввод прерван.'
+    IFS= read -e -r value < /dev/tty || die 'Ввод прерван.'
+    # Trim pasted whitespace (including NBSP); readline handles arrows/backspace.
+    value=${value//$'\u00a0'/ }
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
     printf -v "$1" '%s' "$value"
 }
 ipv4() { python3 -c 'import ipaddress,sys; a=ipaddress.IPv4Address(sys.argv[1]); assert a.is_global and not a.is_multicast and not a.is_reserved' "$1" 2>/dev/null; }
@@ -364,7 +368,7 @@ if [[ ${1:-} == --help ]]; then
     printf '%s\n' 'Запуск на VPS: sudo --preserve-env=SSH_CONNECTION bash node-ip-split.sh' \
       'По умолчанию только аудит. Применение требует отдельного подтверждения.' \
       'Только простой IPv4, два локальных публичных адреса, Docker host network.' \
-      'WARP, policy routing, сторонний NAT и firewall managers: аудит и остановка.' \
+      'UFW и туннели проверяются отдельно. Конфликтующие маршруты и NAT останавливают настройку.' \
       'Отключение: sudo bash node-ip-split.sh --disable (SSH_CONNECTION не требуется).' \
       'Если удалять нечего, --disable переходит к настройке IP; для неё нужен SSH_CONNECTION.' \
       'Поддерживается curl URL | sudo --preserve-env=SSH_CONNECTION bash; ввод через /dev/tty.' \
@@ -447,6 +451,11 @@ ss -lntup > "$RUN/listeners.txt"
 systemctl list-units --type=service --state=running --no-pager > "$RUN/services.txt"
 systemctl list-unit-files --no-pager > "$RUN/unit-files.txt"
 ip -details link show > "$RUN/links.txt"
+ip -j -details link show > "$RUN/links.json"
+: > "$RUN/wg-ports.txt"
+if command -v wg >/dev/null; then
+    wg show all listen-port > "$RUN/wg-ports.txt" 2> "$RUN/wg.log" || true
+fi
 if command -v iptables-legacy-save >/dev/null; then
     iptables-legacy-save > "$RUN/iptables-legacy.txt"
 fi
@@ -462,34 +471,51 @@ fi
 ask NODE 'Контейнер VPN [remnanode], либо - если VPN нет: '
 NODE=${NODE:-remnanode}
 NODE_MODE=none
+NODE_API_PORT=2222
 if [[ $NODE != - ]]; then
     [[ $NODE =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || die 'Некорректное имя контейнера.'
     command -v docker >/dev/null || die 'Docker не найден.'
     NODE_MODE=$(docker inspect --format '{{.HostConfig.NetworkMode}}' "$NODE")
     [[ $(docker inspect --format '{{.State.Running}}' "$NODE") == true ]] || die 'Контейнер ноды не запущен.'
+    detected_api=$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$NODE" | awk -F= '$1 == "NODE_PORT" {print $2; exit}')
+    if [[ $detected_api =~ ^[0-9]{1,5}$ ]] && ((10#$detected_api > 0 && 10#$detected_api <= 65535)); then
+        NODE_API_PORT=$((10#$detected_api))
+    fi
 fi
 TCP_PORTS='' UDP_PORTS=''
 if [[ $NODE != - ]]; then
     printf '%s\n' 'Укажите внешние порты VPN. Если UDP-входа нет, введите -.'
     warn 'Если этот порт нужен сайту или панели на выходном IP, не применяйте ограничение.'
     awk '$1 == "tcp" && /LISTEN/ {print "  TCP " $5}' "$RUN/listeners.txt"
-    ask RAW_TCP 'TCP-порты VPN через запятую (или -): '
-    ask RAW_UDP 'UDP-порты VPN через запятую (или -): '
-    TCP_PORTS=$(ports "$RAW_TCP") || die 'Неверные TCP-порты.'
-    UDP_PORTS=$(ports "$RAW_UDP") || die 'Неверные UDP-порты.'
-    [[ -n $TCP_PORTS$UDP_PORTS ]] || die 'Не указан ни один VPN-порт.'
-    for p in ${TCP_PORTS//,/ }; do [[ $p != "$SSH_PORT" ]] || die 'VPN-порт совпадает с SSH.'; done
+    printf 'Порт %s — управление нодой. Его закрывать не будем.\n' "$NODE_API_PORT"
+    while true; do
+        ask RAW_TCP 'TCP-порты VPN через запятую (обычно 443, либо -): '
+        ask RAW_UDP 'UDP-порты VPN через запятую (Enter — нет): '
+        if ! TCP_PORTS=$(ports "$RAW_TCP" 2>/dev/null); then warn 'TCP: нужны номера портов через запятую.'; continue; fi
+        if ! UDP_PORTS=$(ports "$RAW_UDP" 2>/dev/null); then warn 'UDP: нужны номера портов через запятую.'; continue; fi
+        bad_ports=0
+        for p in ${TCP_PORTS//,/ } ${UDP_PORTS//,/ }; do
+            if [[ $p == "$SSH_PORT" || $p == "$NODE_API_PORT" ]]; then
+                warn "Порт $p используется для SSH или управления нодой. Уберите его из списка."
+                bad_ports=1
+            fi
+        done
+        ((bad_ports == 0)) || continue
+        [[ -n $TCP_PORTS$UDP_PORTS ]] || { warn 'Укажите хотя бы один VPN-порт.'; continue; }
+        break
+    done
+    printf '%s\n' 'Ограничение входа касается только выбранных портов этой ноды. Другие VPN, включая Amnezia, отдельно не перенастраиваются.'
 fi
 
 # Strict eligibility gate. Any unexplained configuration is audit-only.
 BLOCKERS="$RUN/blockers.txt"
 : > "$BLOCKERS"
 [[ $NODE_MODE == host || $NODE_MODE == none ]] || echo 'VPN-контейнер не использует host network.' >> "$BLOCKERS"
-for svc in warp-svc wg-quick@wgcf tailscaled firewalld ufw; do
+for svc in firewalld; do
     if systemctl is-active --quiet "$svc"; then echo "Активен $svc: требуется индивидуальная настройка." >> "$BLOCKERS"; fi
 done
-if grep -Eiq 'wireguard|tun |tun:|happ|wgcf|warp|tailscale' "$RUN/links.txt"; then
-    echo 'Обнаружен туннельный интерфейс.' >> "$BLOCKERS"
+if systemctl is-active --quiet ufw; then
+    ok 'UFW включён. Его правила сохраняем; добавляем только отдельную таблицу скрипта.'
 fi
 if [[ -f $RUN/iptables-legacy.txt ]] && grep -q '^-A ' "$RUN/iptables-legacy.txt"; then
     echo 'Есть правила legacy iptables.' >> "$BLOCKERS"
@@ -520,6 +546,18 @@ if any(str(r.get('table','main')) not in ('main','local','254','255') for r in r
     print('Обнаружены дополнительные таблицы маршрутизации.')
 if a in found and re.fullmatch(r'[a-zA-Z0-9_.:-]{1,15}',found[a]): (d/'interface').write_text(found[a])
 else: print('Не удалось безопасно определить интерфейс.')
+# Interface-bound tunnels are compatible with the narrow physical-interface SNAT.
+# Keep their WireGuard outer UDP packets out of SNAT as well.
+links=json.loads((d/'links.json').read_text())
+wg_ports={}
+for line in (d/'wg-ports.txt').read_text().splitlines():
+    fields=line.split()
+    if len(fields)==2 and fields[1].isdigit() and 0<int(fields[1])<=65535:
+        wg_ports[fields[0]]=int(fields[1])
+for link in links:
+    if link.get('linkinfo',{}).get('info_kind')=='wireguard' and link['ifname'] not in wg_ports:
+        print('Не удалось определить UDP-порт туннеля '+link['ifname']+'. Нужен wg show all listen-port; автонастройка остановлена.')
+(d/'tunnel-ports').write_text(', '.join(map(str,sorted(set(wg_ports.values())))))
 nft=json.loads((d/'nft.json').read_text())
 chains={}
 for item in nft.get('nftables',[]):
@@ -553,6 +591,8 @@ if [[ -s $BLOCKERS ]]; then
     die "Автонастройка не применяется. Аудит сохранён в $RUN. Секреты из архива не публикуйте."
 fi
 IFACE=$(cat "$RUN/interface")
+TUNNEL_PORTS=$(cat "$RUN/tunnel-ports")
+if [[ -n $TUNNEL_PORTS ]]; then printf 'UDP-порты туннелей исключены из смены IP: %s\n' "$TUNNEL_PORTS"; fi
 [[ ! -e /etc/node-ip-split && ! -e /etc/systemd/system/node-ip-split.service ]] || die 'Уже есть установка node-ip-split; сначала используйте её rollback.sh.'
 if nft list table ip node_ip_split >/dev/null 2>&1; then die 'Таблица node_ip_split уже существует.'; fi
 
@@ -581,9 +621,12 @@ add rule ip node_ip_split outbound fib daddr type local return
 add rule ip node_ip_split outbound ct status dnat return
 add rule ip node_ip_split outbound ct mark != 0 return
 add rule ip node_ip_split outbound meta mark != 0 return
-add rule ip node_ip_split outbound oifname "$IFACE" ip saddr { $ENTRY, $EXIT_IP } ct direction original counter snat to $EXIT_IP
 add chain ip node_ip_split inbound { type filter hook input priority -10; policy accept; }
 EOF
+if [[ -n $TUNNEL_PORTS ]]; then
+    echo "add rule ip node_ip_split outbound udp sport { $TUNNEL_PORTS } return" >> "$RUN/rules.nft"
+fi
+echo "add rule ip node_ip_split outbound oifname \"$IFACE\" ip saddr { $ENTRY, $EXIT_IP } ct direction original counter snat to $EXIT_IP" >> "$RUN/rules.nft"
 if [[ -n $TCP_PORTS ]]; then
     echo "add rule ip node_ip_split inbound ip daddr $EXIT_IP ct state new tcp dport { $TCP_PORTS } counter reject with tcp reset" >> "$RUN/rules.nft"
 fi
@@ -594,6 +637,7 @@ nft -c -f "$RUN/rules.nft" || die 'Проверка nftables не пройден
 title 'Шаг 3 из 3 — подтверждение'
 show_plan
 warn 'На выходном IP новые подключения к указанным VPN-портам будут закрыты.'
+if [[ -n $TUNNEL_PORTS ]]; then printf 'Исключения для UDP-портов туннелей: %s\n' "$TUNNEL_PORTS"; fi
 printf '%s\n' 'Новые обычные соединения IPv4 пойдут через выходной IP.' \
   'Панель, DNS, IPv6 и сеть не перезапускаются. Старые соединения могут сохранить прежний IP.' \
   'Через 10 минут изменения отменятся, если вы не проверите новый SSH-вход и не сохраните их.'
@@ -641,7 +685,7 @@ cat > "$RUN/node-ip-split.service" <<EOF
 [Unit]
 Description=IPv4 source separation and VPN entry restriction
 Wants=network-online.target
-After=network-online.target nftables.service docker.service
+After=network-online.target nftables.service ufw.service docker.service
 ConditionPathExists=/etc/node-ip-split/committed
 
 [Service]
@@ -684,6 +728,7 @@ printf 'ssh -o ControlMaster=no -o ControlPath=none -p %s root@%s\n' "$SSH_PORT"
 printf 'В новой сессии выполните: bash %s/verify-ssh.sh\n' "$RUN"
 printf '%s\n' 'Также переподключите VPN к входному IP и проверьте внешний IPv4 в браузере.' \
   'Проверьте, что VPN к выходному IP не подключается. UDP проверяется реальным VPN-клиентом.' \
+  'Проверьте также WARP и другие VPN, если они используются.' \
   'Скрипт не может автоматически проверить внешнюю доступность портов и полный VPN-путь.'
 show_plan
 warn 'Сохраняйте только после проверки нового SSH-подключения и VPN.'
