@@ -372,7 +372,8 @@ if [[ ${1:-} == --help ]]; then
       'Отключение: sudo bash node-ip-split.sh --disable (SSH_CONNECTION не требуется).' \
       'Если удалять нечего, --disable переходит к настройке IP; для неё нужен SSH_CONNECTION.' \
       'Поддерживается curl URL | sudo --preserve-env=SSH_CONNECTION bash; ввод через /dev/tty.' \
-      'Без аргументов: меню. --setup: настройка. --status: журнал изменений.'
+      'Без аргументов: меню. --setup: настройка. --status: журнал изменений.' \
+      'После применения правила сохраняются сразу. Новое SSH-подключение и таймер отката не используются.'
     exit 0
 fi
 [[ $EUID == 0 ]] || die 'Нужен root на VPS.'
@@ -413,7 +414,7 @@ case $MODE in
     --setup) ;;
     *) die 'Допустимые аргументы: --setup, --disable, --status, --help.' ;;
 esac
-for bin in python3 ip ss nft iptables-save systemctl systemd-run curl flock tar; do
+for bin in python3 ip ss nft iptables-save systemctl curl flock tar; do
     command -v "$bin" >/dev/null || die "Не найдена $bin. Установите соответствующий пакет отдельно и повторите."
 done
 [[ -d /run/systemd/system ]] || die 'Нужен systemd.'
@@ -640,13 +641,13 @@ warn 'На выходном IP новые подключения к указан
 if [[ -n $TUNNEL_PORTS ]]; then printf 'Исключения для UDP-портов туннелей: %s\n' "$TUNNEL_PORTS"; fi
 printf '%s\n' 'Новые обычные соединения IPv4 пойдут через выходной IP.' \
   'Панель, DNS, IPv6 и сеть не перезапускаются. Старые соединения могут сохранить прежний IP.' \
-  'Через 10 минут изменения отменятся, если вы не проверите новый SSH-вход и не сохраните их.'
+  'Правила сохранятся сразу. Автоматического отката и проверки нового SSH-входа нет.'
 printf 'Полные правила: %s/rules.nft\n' "$RUN"
-ask APPLY '1 — применить, Enter — отменить: '
+warn 'При потере связи правила останутся. Для исправления может понадобиться консоль хостера.'
+ask APPLY '1 — применить и сохранить, Enter — отменить: '
 [[ $APPLY == 1 || $APPLY == ПРИМЕНИТЬ ]] || { printf 'Настройки не изменены. Отчёт: %s\n' "$RUN"; exit 0; }
 
 NFT=$(command -v nft)
-TIMER="node-ip-split-rollback-$(date +%s)-$$"
 write_state_tool > "$RUN/state-tool.py"
 cat > "$RUN/rollback.sh" <<EOF
 #!/usr/bin/env bash
@@ -658,18 +659,17 @@ python3 '$RUN/state-tool.py' disable --run '$RUN' "\$@"
 date -Is > '$RUN/rolled-back'
 EOF
 chmod 700 "$RUN/rollback.sh"
-ARMED=0
-cleanup() {
+# Errors/interruption retain all changes already made; cleanup is manual only.
+report_exit() {
     local rc=$?
     trap - EXIT HUP INT TERM
-    if ((ARMED)); then
-        flock -u 8 2>/dev/null || true
-        printf '\nИзменения не подтверждены. Выполняется откат.\n'
-        if bash "$RUN/rollback.sh"; then systemctl stop "$TIMER.timer" || true; fi
+    if ((rc != 0)); then
+        printf '\nНастройка не завершена. Уже внесённые изменения НЕ отменены.\n' >&2
+        printf 'Отчёт: %s; ручное отключение: bash %s/rollback.sh\n' "$RUN" "$RUN" >&2
     fi
     exit "$rc"
 }
-trap cleanup EXIT
+trap report_exit EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM HUP
 cat > "$RUN/apply.sh" <<EOF
@@ -698,61 +698,40 @@ WantedBy=multi-user.target
 EOF
 : > "$RUN/committed"
 prepare_state_tool
-state_tool init "$RUN" "$TIMER" "$ENTRY" "$EXIT_IP"
-systemd-run --unit="$TIMER" --on-active=10min --timer-property=AccuracySec=1s /bin/bash "$RUN/rollback.sh" --pending
-ARMED=1
+state_tool init "$RUN" "" "$ENTRY" "$EXIT_IP"
+exec 8>/run/node-ip-split-change.lock
+flock -x 8
 mkdir -m 700 /etc/node-ip-split
 install -m 600 "$RUN/rules.nft" /etc/node-ip-split/rules.nft
 install -m 700 "$RUN/apply.sh" /etc/node-ip-split/apply.sh
+install -m 600 "$RUN/committed" /etc/node-ip-split/committed
 install -m 644 "$RUN/node-ip-split.service" /etc/systemd/system/node-ip-split.service
 systemctl daemon-reload
-bash /etc/node-ip-split/apply.sh
+systemctl enable node-ip-split.service
+systemctl start node-ip-split.service
 state_tool snapshot
-nft list table ip node_ip_split > "$RUN/nft.after.txt"
-OBSERVED=$(curl --noproxy '*' -4 --connect-timeout 8 --max-time 15 -fsS https://api.ipify.org)
-[[ $OBSERVED == "$EXIT_IP" ]] || die "Обычный исходящий IPv4: $OBSERVED, ожидался $EXIT_IP."
-printf 'Исходящий IPv4 сервера подтверждён: %s\n' "$OBSERVED"
-cat > "$RUN/verify-ssh.sh" <<EOF
-#!/usr/bin/env bash
-set -eu
-[[ \$EUID == 0 ]] || exit 1
-read -r client port server sshport <<< "\${SSH_CONNECTION:-}"
-[[ \$server == '$ENTRY' && \$sshport == '$SSH_PORT' ]] || { echo 'Нужна SSH-сессия через входной IP'; exit 1; }
-[[ "\$client \$port" != '$CLIENT $CLIENT_PORT' ]] || { echo 'Нужно НОВОЕ SSH-подключение'; exit 1; }
-date -Is > '$RUN/ssh-verified'
-echo 'Новое SSH-подключение через входной IP подтверждено.'
-EOF
-chmod 700 "$RUN/verify-ssh.sh"
-printf '\nВ другом терминале подключитесь заново (без SSH multiplexing):\n'
-printf 'ssh -o ControlMaster=no -o ControlPath=none -p %s root@%s\n' "$SSH_PORT" "$ENTRY"
-printf 'В новой сессии выполните: bash %s/verify-ssh.sh\n' "$RUN"
-printf '%s\n' 'Также переподключите VPN к входному IP и проверьте внешний IPv4 в браузере.' \
-  'Проверьте, что VPN к выходному IP не подключается. UDP проверяется реальным VPN-клиентом.' \
-  'Проверьте также WARP и другие VPN, если они используются.' \
-  'Скрипт не может автоматически проверить внешнюю доступность портов и полный VPN-путь.'
-show_plan
-warn 'Сохраняйте только после проверки нового SSH-подключения и VPN.'
-ask KEEP '1 — сохранить после проверок, Enter — вернуть прежние настройки: '
-[[ ( $KEEP == 1 || $KEEP == СОХРАНИТЬ ) && -f $RUN/ssh-verified ]] || die 'Нет подтверждения или нового SSH-подключения.'
-[[ ! -f $RUN/rolled-back ]] || die 'Таймер уже выполнил откат.'
-# Stop the watchdog before committing, and detect a concurrently started rollback.
-exec 8>/run/node-ip-split-change.lock
-flock -x 8
-systemctl stop "$TIMER.timer"
-if systemctl is-active --quiet "$TIMER.service" || [[ -f $RUN/rolled-back ]]; then die 'Откат уже начался.'; fi
-[[ -e /etc/node-ip-split/rules.nft ]] || die 'Файлы конфигурации отсутствуют.'
-touch /etc/node-ip-split/committed
-systemctl enable --now node-ip-split.service
 systemctl is-enabled --quiet node-ip-split.service
 systemctl is-active --quiet node-ip-split.service
-nft -c -f /etc/node-ip-split/rules.nft
 state_tool commit
-ARMED=0
 flock -u 8
+nft list table ip node_ip_split > "$RUN/nft.after.txt"
+# Verification is informational: a failed website probe never removes saved rules.
+OBSERVED='не проверен'
+if PROBE=$(curl --noproxy '*' -4 --connect-timeout 8 --max-time 15 -fsS https://api.ipify.org); then
+    OBSERVED=${PROBE//$'\r'/}; OBSERVED=${OBSERVED//$'\n'/}
+    if [[ $OBSERVED == "$EXIT_IP" ]]; then
+        ok "Исходящий IPv4 подтверждён: $OBSERVED"
+    else
+        warn "Сайт показал $OBSERVED вместо $EXIT_IP. Правила сохранены; проверьте выход вручную."
+    fi
+else
+    warn 'Сайт проверки IP не ответил. Правила сохранены; проверьте выход вручную.'
+fi
 cat > "$RUN/result.txt" <<EOF
 Вход: $ENTRY; выход: $EXIT_IP; интерфейс: $IFACE
-Исходящий IPv4 сервера проверен через HTTPS: $OBSERVED
-Новая SSH-сессия: подтверждена файлом ssh-verified.
+Результат проверки исходящего IPv4 через HTTPS: $OBSERVED
+Новое SSH-подключение не запрашивалось и не проверялось.
+Автоматический откат отключён; правила сохраняются до ручного удаления.
 VPN TCP: $TCP_PORTS; UDP: $UDP_PORTS
 Созданы /etc/node-ip-split/{rules.nft,apply.sh,committed}
 Создан /etc/systemd/system/node-ip-split.service (enabled, active).
@@ -766,4 +745,5 @@ ok 'Настройки сохранены.'
 printf 'Вход: %s   Выход: %s\n' "$ENTRY" "$EXIT_IP"
 printf 'Отчёт и резервные копии: %s\n' "$RUN"
 printf 'Вернуть прежние настройки: bash %s/rollback.sh\n' "$RUN"
-printf '%s\n' 'Автозапуск включён. Реальная перезагрузка и VPN-клиент скриптом не проверялись.'
+printf '%s\n' 'Автозапуск включён. Правила не будут отменены по таймеру.' \
+  'SSH, VPN и WARP проверьте самостоятельно. Реальная перезагрузка не проверялась.'
