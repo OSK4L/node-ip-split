@@ -208,6 +208,14 @@ def main():
         if conflicts(s) or s['nft'] is None or any(digest(p)!=h for p,h in s['files'].items()):
             raise RuntimeError('Конфигурация изменилась или неполна до подтверждения.')
         s['status']='active'; s['committed_at']=now(); save(s)
+    elif command=='count':
+        s=json.loads(Path(sys.argv[2]).read_text()) if len(sys.argv)>2 else load()
+        print(len(s['files'])+len(s['ufw'])+int(s['nft'] is not None))
+    elif command=='retire-empty':
+        s=load()
+        if s['files'] or s['ufw'] or s['nft'] is not None:
+            raise RuntimeError('Журнал не пуст; автоматический переход отменён.')
+        s['status']='disabled'; s['disabled_at']=now(); save(s)
     elif command=='status': summary(load()) if STATE.exists() else print('Журнала пока нет.')
     elif command=='disable':
         s=load()
@@ -229,8 +237,17 @@ prepare_state_tool() {
 }
 state_tool() { python3 /var/lib/node-ip-split/state-tool.py "$@"; }
 
+continue_setup() {
+    printf '%s\n' 'Правил и файлов скрипта для удаления нет. Переходим к настройке входного и выходного IP.'
+    NEXT_ACTION=setup
+    flock -u 8
+    exec 8>&-
+    flock -u 9
+    exec 9>&-
+}
+
 disable_split() {
-    local confirm backup
+    local confirm backup count
     for bin in python3 nft systemctl flock tar; do
         command -v "$bin" >/dev/null || die "Для отключения нужна команда $bin."
     done
@@ -249,13 +266,33 @@ disable_split() {
     if ((${#files[@]})); then tar -C / -czf "$backup/config.before.tar.gz" "${files[@]}"; fi
     printf 'Резервные копии и отчёт: %s\n' "$backup"
     if [[ ! -f /var/lib/node-ip-split/state.json ]]; then
-        printf '%s\n' 'Старая версия не вела журнал. Найдены КАНДИДАТЫ, а не доказанно собственные правила:'
-        state_tool discover "$backup/legacy-candidates.json"
+        state_tool discover "$backup/legacy-candidates.json" > "$backup/discovery.txt"
+        count=$(state_tool count "$backup/legacy-candidates.json")
+        if [[ $count == 0 ]]; then
+            continue_setup
+            return
+        fi
+        printf '%s\n' 'Нет журнала. Найдены КАНДИДАТЫ, а не доказанно собственные правила:'
+        cat "$backup/discovery.txt"
         printf '%s\n' 'Импорт допустим, только если ВСЕ перечисленные файлы и правила добавлены нами.' \
           'Если есть посторонние объекты — отмените. По одному IP определить владельца нельзя.'
         ask confirm 'Введите ИМПОРТИРОВАТЬ для однократной регистрации этих объектов или Enter для отмены: '
         [[ $confirm == ИМПОРТИРОВАТЬ ]] || { echo 'Отменено. Сеть не изменена.'; return; }
         state_tool import "$backup/legacy-candidates.json"
+    fi
+    count=$(state_tool count)
+    if [[ $count == 0 ]]; then
+        # Old versions could save an empty adopted journal. Retire it so init can proceed.
+        # Check live legacy objects too: lack of records alone does not establish absence.
+        state_tool discover "$backup/legacy-candidates.json" > "$backup/discovery.txt"
+        count=$(state_tool count "$backup/legacy-candidates.json")
+        if [[ $count != 0 ]]; then
+            cat "$backup/discovery.txt"
+            die 'Журнал пуст, но найдены незарегистрированные объекты. Автоматическая настройка отменена.'
+        fi
+        state_tool retire-empty
+        continue_setup
+        return
     fi
     state_tool status
     printf '%s\n' 'Удаляются только объекты из журнала, совпадающие с сохранённым состоянием.' \
@@ -276,6 +313,7 @@ if [[ ${1:-} == --help ]]; then
       'Только простой IPv4, два локальных публичных адреса, Docker host network.' \
       'WARP, policy routing, сторонний NAT и firewall managers: аудит и остановка.' \
       'Отключение: sudo bash node-ip-split.sh --disable (SSH_CONNECTION не требуется).' \
+      'Если удалять нечего, --disable переходит к настройке IP; для неё нужен SSH_CONNECTION.' \
       'Поддерживается curl URL | sudo --preserve-env=SSH_CONNECTION bash; ввод через /dev/tty.' \
       'Без аргументов: меню. --setup: настройка. --status: журнал изменений.'
     exit 0
@@ -290,8 +328,13 @@ if [[ -z $MODE ]]; then
     ask CHOICE 'Выберите действие [0]: '
     case $CHOICE in 1) MODE=--setup ;; 2) MODE=--disable ;; ''|0) exit 0 ;; *) die 'Неизвестный пункт.' ;; esac
 fi
+NEXT_ACTION=''
 case $MODE in
-    --disable) disable_split; exit 0 ;;
+    --disable)
+        disable_split
+        [[ $NEXT_ACTION == setup ]] || exit 0
+        MODE=--setup
+        ;;
     --status) prepare_state_tool; state_tool status; exit 0 ;;
     --setup) ;;
     *) die 'Допустимые аргументы: --setup, --disable, --status, --help.' ;;
