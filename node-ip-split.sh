@@ -24,75 +24,250 @@ assert all(x.strip().isdigit() and 1<=int(x)<=65535 for x in a), 'Порты: ч
 print(', '.join(str(x) for x in sorted(set(map(int,a)))))
 PY
 }
+# A persistent journal survives uninstall. Never infer ownership from an IP alone.
+write_state_tool() {
+    cat <<'STATE_PY'
+import datetime
+import hashlib
+import ipaddress
+import json
+import os
+from pathlib import Path
+import shlex
+import subprocess
+import sys
+
+STATE = Path('/var/lib/node-ip-split/state.json')
+FILES = ['/etc/node-ip-split/rules.nft', '/etc/node-ip-split/apply.sh',
+         '/etc/node-ip-split/committed', '/etc/systemd/system/node-ip-split.service']
+
+def run(args, check=True):
+    return subprocess.run(args, text=True, capture_output=True, check=check)
+
+def now():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+def save(s):
+    STATE.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    tmp = STATE.with_suffix('.tmp')
+    with tmp.open('w') as f:
+        os.chmod(tmp, 0o600)
+        json.dump(s, f, ensure_ascii=False, indent=2)
+        f.flush(); os.fsync(f.fileno())
+    os.replace(tmp, STATE)
+
+def load():
+    s = json.loads(STATE.read_text())
+    if s.get('schema') != 1 or s.get('owner') != 'node-ip-split':
+        raise RuntimeError('Неизвестный формат журнала; автоматическое удаление отменено.')
+    if any(p not in FILES for p in s.get('files', {})):
+        raise RuntimeError('Неизвестные пути в журнале.')
+    return s
+
+def digest(path):
+    p = Path(path)
+    if p.is_symlink(): raise RuntimeError('Обнаружена символическая ссылка: ' + str(p))
+    return hashlib.sha256(p.read_bytes()).hexdigest() if p.exists() else None
+
+def canonical(v):
+    # Ignore runtime counters and kernel-assigned handles; preserve rule semantics/order.
+    if isinstance(v, list): return [canonical(x) for x in v if not (isinstance(x, dict) and 'metainfo' in x)]
+    if isinstance(v, dict):
+        return {k: canonical(x) for k,x in v.items() if k not in ('handle','packets','bytes')}
+    return v
+
+def table():
+    tables = json.loads(run(['nft','-j','list','tables']).stdout)
+    present = any(x.get('table', {}).get('family') == 'ip' and
+                  x.get('table', {}).get('name') == 'node_ip_split'
+                  for x in tables.get('nftables', []))
+    if not present: return None
+    return canonical(json.loads(run(['nft','-j','list','table','ip','node_ip_split']).stdout))
+
+def ufw_rules():
+    import shutil
+    if not shutil.which('ufw'): return []
+    return [shlex.split(line) for line in run(['ufw','show','added']).stdout.splitlines()
+            if line.startswith('ufw ')]
+
+def candidate(tokens):
+    # Only exact inbound deny, any source, one IPv4 destination and TCP/443.
+    # No interfaces, source ports, ranges, routing rules or unrelated options.
+    t = tokens[:]
+    if t[:2] != ['ufw','deny']: return False
+    t = t[2:]
+    if t[:1] == ['in']: t = t[1:]
+    values = {}
+    while t:
+        if len(t)<2 or t[0] not in ('from','to','port','proto','comment') or t[0] in values: return False
+        values[t[0]]=t[1]; t=t[2:]
+    try: ipaddress.IPv4Address(values.get('to',''))
+    except ValueError: return False
+    return (values.get('from','any') == 'any' and values.get('port') == '443'
+            and values.get('proto') == 'tcp')
+
+def fresh():
+    return dict(schema=1, owner='node-ip-split', created=now(), status='planned',
+                files={}, ufw=[], nft=None, timer=None,
+                note='Маршруты, адреса и DNS не изменялись и не восстанавливаются.')
+
+def discover():
+    s=fresh(); s['status']='legacy-candidates'
+    s['files']={p:digest(p) for p in FILES if Path(p).exists()}
+    s['nft']=table()
+    s['ufw']=[r for r in ufw_rules() if candidate(r)]
+    return s
+
+def summary(s):
+    print('Статус журнала:', s['status'])
+    print(s.get('note',''))
+    for p in s['files']: print('Файл:',p)
+    if s['nft'] is not None: print('Таблица: ip node_ip_split')
+    for r in s['ufw']: print('UFW:',shlex.join(r))
+    if not s['files'] and s['nft'] is None and not s['ufw']: print('Объектов для удаления не найдено.')
+
+def conflicts(s):
+    problems=[]
+    for p,h in s['files'].items():
+        current=digest(p)
+        if current is not None and current != h: problems.append('Файл изменён после установки: '+p)
+    current=table()
+    if current is not None and current != s['nft']:
+        problems.append('Таблица node_ip_split отличается от сохранённого снимка.')
+    # A matching rule that gained a comment/changed its shape is not silently claimed.
+    current_rules=ufw_rules() if s['ufw'] else []
+    for rule in s['ufw']:
+        if rule not in current_rules:
+            print('Точного правила UFW больше нет; похожие правила не трогаем:',shlex.join(rule))
+    return problems
+
+def disable(s, pending=False):
+    if s['status']=='disabled':
+        print('Изменения из журнала уже удалены. Новые посторонние объекты не трогаем.'); return
+    if pending and s['status'] != 'planned': return
+    problems=conflicts(s)
+    if problems: raise RuntimeError('\n'.join(problems)+'\nУдаление отменено; нужен разбор изменений.')
+    # Use only the timer recorded for THIS installation.
+    timer=s.get('timer')
+    if timer:
+        import re
+        if not re.fullmatch(r'node-ip-split-rollback-[0-9]+-[0-9]+',timer): raise RuntimeError('Неверный timer в журнале.')
+        run(['systemctl','stop',timer+'.timer'])
+    unit=FILES[-1]
+    if unit in s['files']:
+        # Absent unit can still have a loaded state; disable is safe for the recorded name.
+        result=run(['systemctl','disable','--now','node-ip-split.service'],check=False)
+        if result.returncode and Path(unit).exists(): raise RuntimeError(result.stderr)
+    if s['nft'] is not None and table() is not None:
+        run(['nft','delete','table','ip','node_ip_split'])
+    for r in s['ufw']:
+        if not candidate(r): raise RuntimeError('Недопустимое правило UFW в журнале.')
+        if r in ufw_rules():
+            # Delete one EXACT registered rule, not its changing numbered position.
+            run(['ufw','--force','delete']+r[1:])
+            if r in ufw_rules(): raise RuntimeError('Правило осталось или есть дубликат: '+shlex.join(r))
+    for p,h in s['files'].items():
+        if digest(p) is not None:
+            if digest(p)!=h: raise RuntimeError('Файл изменился во время удаления: '+p)
+            Path(p).unlink()
+    run(['systemctl','daemon-reload'])
+    try: Path('/etc/node-ip-split').rmdir()
+    except (FileNotFoundError,OSError): pass
+    s['status']='disabled'; s['disabled_at']=now(); save(s)
+    print('Отключено. Журнал сохранён:',STATE)
+    print('Маршруты, адреса, WARP и посторонние правила не изменялись.')
+
+def main():
+    command=sys.argv[1]
+    if command=='discover':
+        s=discover(); Path(sys.argv[2]).write_text(json.dumps(s,ensure_ascii=False,indent=2)); summary(s)
+    elif command=='import':
+        s=json.loads(Path(sys.argv[2]).read_text())
+        # Do not adopt unseen or changed objects after user review.
+        current=discover()
+        if any(s[k]!=current[k] for k in ('files','nft','ufw')): raise RuntimeError('Состояние изменилось после просмотра; повторите импорт.')
+        if STATE.exists() and load()['status'] not in ('disabled',): raise RuntimeError('Уже есть активный журнал.')
+        s['status']='adopted'; s['adopted_at']=now(); save(s)
+    elif command=='init':
+        if STATE.exists() and load()['status']!='disabled': raise RuntimeError('Сначала отключите предыдущую установку.')
+        if STATE.exists():
+            archive=STATE.parent/('history-'+datetime.datetime.now().strftime('%Y%m%d-%H%M%S-%f')+'.json')
+            archive.write_bytes(STATE.read_bytes()); os.chmod(archive,0o600)
+        s=fresh(); s['backup']=sys.argv[2]; s['timer']=sys.argv[3]
+        s['entry']=sys.argv[4]; s['exit']=sys.argv[5]
+        # Write intent BEFORE touching live files.
+        for path,name in zip(FILES,('rules.nft','apply.sh','committed','node-ip-split.service')):
+            if Path(path).exists() or Path(path).is_symlink(): raise RuntimeError('Путь уже существует: '+path)
+            s['files'][path]=digest(Path(sys.argv[2])/name)
+        if table() is not None: raise RuntimeError('Таблица уже существует.')
+        save(s)
+    elif command=='snapshot':
+        s=load(); s['nft']=table(); save(s)
+    elif command=='commit':
+        s=load()
+        if conflicts(s) or s['nft'] is None or any(digest(p)!=h for p,h in s['files'].items()):
+            raise RuntimeError('Конфигурация изменилась или неполна до подтверждения.')
+        s['status']='active'; s['committed_at']=now(); save(s)
+    elif command=='status': summary(load()) if STATE.exists() else print('Журнала пока нет.')
+    elif command=='disable':
+        s=load()
+        if '--run' in sys.argv[2:] and s.get('backup') != sys.argv[sys.argv.index('--run')+1]:
+            raise RuntimeError('Этот rollback относится к другой установке; текущая не изменена.')
+        disable(s, '--pending' in sys.argv[2:])
+    else: raise RuntimeError('Неизвестная операция.')
+
+if __name__=='__main__':
+    try: main()
+    except Exception as e:
+        print('ОСТАНОВКА: '+str(e),file=sys.stderr); sys.exit(1)
+STATE_PY
+}
+prepare_state_tool() {
+    install -d -m 700 /var/lib/node-ip-split
+    write_state_tool > /var/lib/node-ip-split/state-tool.py
+    chmod 600 /var/lib/node-ip-split/state-tool.py
+}
+state_tool() { python3 /var/lib/node-ip-split/state-tool.py "$@"; }
+
 disable_split() {
-    local target='' remove_ufw='' confirm='' backup unit
+    local confirm backup
     for bin in python3 nft systemctl flock tar; do
         command -v "$bin" >/dev/null || die "Для отключения нужна команда $bin."
     done
     [[ -d /run/systemd/system ]] || die 'Нужен systemd.'
     exec 9>/run/node-ip-split.lock
-    flock -n 9 || die 'Сначала завершите другой запущенный экземпляр скрипта.'
-    # Confirm netlink access before treating an absent table as an uninstalled setup.
-    nft list tables >/dev/null
-    printf '%s\n' 'Будут удалены только таблица ip node_ip_split и автозапуск node-ip-split.' \
-      'Панель, DNS, адреса, маршруты, WARP и остальные таблицы firewall не изменяются.' \
-      'Резервные копии предыдущих запусков сохранятся.'
-    if command -v ufw >/dev/null; then
-        ufw status numbered
-        ask remove_ufw 'Удалить также добавленный вручную запрет UFW для выходного IPv4:443/TCP? [да/нет]: '
-        if [[ $remove_ufw == да ]]; then
-            ask target 'Выходной IPv4, для которого добавляли запрет (например 185.252.177.114): '
-            ipv4 "$target" || die 'Некорректный публичный IPv4.'
-            printf 'Будет выполнено: ufw --force delete deny in proto tcp from any to %s port 443\n' "$target"
-            printf '%s\n' 'У ручного правила нет метки владельца: подтвердите, что это именно добавленный нами запрет.'
-        fi
-    fi
-    printf '%s\n' 'После удаления ограничений выходной IP снова сможет принимать подключения, если остальные правила разрешают.' \
-      'После удаления SNAT новые соединения используют обычные настройки системы.' \
-      'Уже установленные NAT-соединения могут сохранять адрес до переподключения; conntrack не очищается.'
-    ask confirm 'Введите ОТКЛЮЧИТЬ для выполнения; Enter — отмена: '
-    [[ $confirm == ОТКЛЮЧИТЬ ]] || { echo 'Отменено, изменений нет.'; return; }
+    flock -n 9 || die 'Сначала завершите другой экземпляр скрипта.'
+    exec 8>/run/node-ip-split-change.lock
+    flock -x 8
+    prepare_state_tool
     backup=$(mktemp -d /root/node-ip-split-disable-XXXXXXXX)
     nft list ruleset > "$backup/nft.before.txt"
     local files=()
-    for unit in /etc/node-ip-split /etc/systemd/system/node-ip-split.service /etc/ufw; do
-        [[ ! -e $unit ]] || files+=("${unit#/}")
+    for item in /etc/node-ip-split /etc/systemd/system/node-ip-split.service /etc/ufw /var/lib/node-ip-split; do
+        [[ ! -e $item ]] || files+=("${item#/}")
     done
     if ((${#files[@]})); then tar -C / -czf "$backup/config.before.tar.gz" "${files[@]}"; fi
-    printf 'Резервная копия перед отключением: %s\n' "$backup"
-    # Stop watchdogs before taking their lock; a watchdog may already be running.
-    systemctl list-units --all --plain --no-legend 'node-ip-split-rollback-*' > "$backup/watchdogs.before.txt"
-    while read -r unit _; do
-        [[ $unit =~ ^node-ip-split-rollback-[0-9]+-[0-9]+\.(timer|service)$ ]] || continue
-        systemctl stop "$unit"
-    done < "$backup/watchdogs.before.txt"
-    exec 8>/run/node-ip-split-change.lock
-    flock -x 8
-    if [[ -e /etc/systemd/system/node-ip-split.service ]]; then
-        systemctl disable --now node-ip-split.service
+    printf 'Резервные копии и отчёт: %s\n' "$backup"
+    if [[ ! -f /var/lib/node-ip-split/state.json ]]; then
+        printf '%s\n' 'Старая версия не вела журнал. Найдены КАНДИДАТЫ, а не доказанно собственные правила:'
+        state_tool discover "$backup/legacy-candidates.json"
+        printf '%s\n' 'Импорт допустим, только если ВСЕ перечисленные файлы и правила добавлены нами.' \
+          'Если есть посторонние объекты — отмените. По одному IP определить владельца нельзя.'
+        ask confirm 'Введите ИМПОРТИРОВАТЬ для однократной регистрации этих объектов или Enter для отмены: '
+        [[ $confirm == ИМПОРТИРОВАТЬ ]] || { echo 'Отменено. Сеть не изменена.'; return; }
+        state_tool import "$backup/legacy-candidates.json"
     fi
-    if nft list table ip node_ip_split >/dev/null 2>&1; then
-        nft delete table ip node_ip_split
-    fi
-    rm -f /etc/systemd/system/node-ip-split.service
-    rm -f /etc/node-ip-split/rules.nft /etc/node-ip-split/apply.sh /etc/node-ip-split/committed
-    if [[ -d /etc/node-ip-split ]]; then
-        rmdir /etc/node-ip-split 2>/dev/null || printf '%s\n' 'В /etc/node-ip-split остались дополнительные файлы; они сохранены.'
-    fi
-    systemctl daemon-reload
-    if [[ $remove_ufw == да ]]; then
-        ufw --force delete deny in proto tcp from any to "$target" port 443
-        ufw status numbered | tee "$backup/ufw.after.txt"
-    fi
+    state_tool status
+    printf '%s\n' 'Удаляются только объекты из журнала, совпадающие с сохранённым состоянием.' \
+      'Маршруты (включая вручную выбранный src), IP, DNS и WARP не откатываются.' \
+      'Удаление запрета снова откроет порт, если остальные правила разрешают.' \
+      'Текущие NAT-соединения могут сохранять адрес до переподключения.'
+    ask confirm 'Введите ОТКЛЮЧИТЬ для удаления зарегистрированных изменений или Enter для отмены: '
+    [[ $confirm == ОТКЛЮЧИТЬ ]] || { echo 'Отменено. Сеть не изменена.'; return; }
+    state_tool disable | tee "$backup/result.txt"
     nft list tables > "$backup/tables.after.txt"
-    if nft list table ip node_ip_split >/dev/null 2>&1; then die 'Таблица осталась; отключение не завершено.'; fi
-    [[ ! -e /etc/systemd/system/node-ip-split.service ]] || die 'Файл службы остался.'
-    flock -u 8
-    printf '%s\n' 'Отключено: таблица node_ip_split удалена/отсутствует, файл автозапуска удалён/отсутствует.' \
-      'Сеть и сервер не перезапускались. Внешняя доступность портов этим скриптом не проверялась.' | tee "$backup/result.txt"
-    if [[ $remove_ufw == да ]]; then
-        printf 'Запрошено удаление точного запрета UFW для %s:443/TCP; итоговые правила в ufw.after.txt.\n' "$target" | tee -a "$backup/result.txt"
-    fi
+    if command -v ufw >/dev/null; then ufw status numbered | tee "$backup/ufw.after.txt"; fi
+    printf '%s\n' 'Журнал остаётся в /var/lib/node-ip-split/state.json; повторное отключение безопасно.'
 }
 
 if [[ ${1:-} == --help ]]; then
@@ -102,7 +277,7 @@ if [[ ${1:-} == --help ]]; then
       'WARP, policy routing, сторонний NAT и firewall managers: аудит и остановка.' \
       'Отключение: sudo bash node-ip-split.sh --disable (SSH_CONNECTION не требуется).' \
       'Поддерживается curl URL | sudo --preserve-env=SSH_CONNECTION bash; ввод через /dev/tty.' \
-      'Без аргументов: меню настройки или отключения. --setup: сразу настройка.'
+      'Без аргументов: меню. --setup: настройка. --status: журнал изменений.'
     exit 0
 fi
 [[ $EUID == 0 ]] || die 'Нужен root на VPS.'
@@ -117,8 +292,9 @@ if [[ -z $MODE ]]; then
 fi
 case $MODE in
     --disable) disable_split; exit 0 ;;
+    --status) prepare_state_tool; state_tool status; exit 0 ;;
     --setup) ;;
-    *) die 'Допустимые аргументы: --setup, --disable, --help.' ;;
+    *) die 'Допустимые аргументы: --setup, --disable, --status, --help.' ;;
 esac
 for bin in python3 ip ss nft iptables-save systemctl systemd-run curl flock tar; do
     command -v "$bin" >/dev/null || die "Не найдена $bin. Установите соответствующий пакет отдельно и повторите."
@@ -312,22 +488,15 @@ ask APPLY 'Введите ПРИМЕНИТЬ для выполнения; Enter 
 
 NFT=$(command -v nft)
 TIMER="node-ip-split-rollback-$(date +%s)-$$"
+write_state_tool > "$RUN/state-tool.py"
 cat > "$RUN/rollback.sh" <<EOF
 #!/usr/bin/env bash
-set -u
+set -euo pipefail
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 exec 8>/run/node-ip-split-change.lock
 flock -x 8
-if [[ \${1:-} == --pending && -e /etc/node-ip-split/committed ]]; then exit 0; fi
-systemctl disable --now node-ip-split.service >/dev/null 2>&1 || true
-if nft list table ip node_ip_split >/dev/null 2>&1; then
-    nft delete table ip node_ip_split || exit 1
-fi
-rm -f /etc/systemd/system/node-ip-split.service
-rm -rf /etc/node-ip-split
-systemctl daemon-reload
+python3 '$RUN/state-tool.py' disable --run '$RUN' "\$@"
 date -Is > '$RUN/rolled-back'
-echo 'Правила node-ip-split удалены; снимки и отчёт: $RUN'
 EOF
 chmod 700 "$RUN/rollback.sh"
 ARMED=0
@@ -344,11 +513,7 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM HUP
-systemd-run --unit="$TIMER" --on-active=10min --timer-property=AccuracySec=1s /bin/bash "$RUN/rollback.sh" --pending
-ARMED=1
-mkdir -m 700 /etc/node-ip-split
-install -m 600 "$RUN/rules.nft" /etc/node-ip-split/rules.nft
-cat > /etc/node-ip-split/apply.sh <<EOF
+cat > "$RUN/apply.sh" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
@@ -356,8 +521,8 @@ ip -4 addr show dev '$IFACE' | grep -Fq 'inet $ENTRY/'
 ip -4 addr show dev '$IFACE' | grep -Fq 'inet $EXIT_IP/'
 exec '$NFT' -f /etc/node-ip-split/rules.nft
 EOF
-chmod 700 /etc/node-ip-split/apply.sh
-cat > /etc/systemd/system/node-ip-split.service <<EOF
+chmod 700 "$RUN/apply.sh"
+cat > "$RUN/node-ip-split.service" <<EOF
 [Unit]
 Description=IPv4 source separation and VPN entry restriction
 Wants=network-online.target
@@ -372,8 +537,18 @@ RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
 EOF
+: > "$RUN/committed"
+prepare_state_tool
+state_tool init "$RUN" "$TIMER" "$ENTRY" "$EXIT_IP"
+systemd-run --unit="$TIMER" --on-active=10min --timer-property=AccuracySec=1s /bin/bash "$RUN/rollback.sh" --pending
+ARMED=1
+mkdir -m 700 /etc/node-ip-split
+install -m 600 "$RUN/rules.nft" /etc/node-ip-split/rules.nft
+install -m 700 "$RUN/apply.sh" /etc/node-ip-split/apply.sh
+install -m 644 "$RUN/node-ip-split.service" /etc/systemd/system/node-ip-split.service
 systemctl daemon-reload
 bash /etc/node-ip-split/apply.sh
+state_tool snapshot
 nft list table ip node_ip_split > "$RUN/nft.after.txt"
 OBSERVED=$(curl --noproxy '*' -4 --connect-timeout 8 --max-time 15 -fsS https://api.ipify.org)
 [[ $OBSERVED == "$EXIT_IP" ]] || die "Обычный исходящий IPv4: $OBSERVED, ожидался $EXIT_IP."
@@ -409,6 +584,7 @@ systemctl enable --now node-ip-split.service
 systemctl is-enabled --quiet node-ip-split.service
 systemctl is-active --quiet node-ip-split.service
 nft -c -f /etc/node-ip-split/rules.nft
+state_tool commit
 ARMED=0
 flock -u 8
 cat > "$RUN/result.txt" <<EOF
@@ -431,5 +607,6 @@ printf '%s\n' 'Созданы: /etc/node-ip-split/{rules.nft,apply.sh,committed}
   'Проверены: исходящий IPv4, новое SSH-соединение, синтаксис nft, включение systemd unit.' \
   'Реальная перезагрузка и проверка VPN-клиентом скриптом НЕ выполнялись.' \
   'Постоянство адресов у провайдера/в netplan требует проверки: скрипт не назначает IP заново.' \
+  'Журнал изменений: /var/lib/node-ip-split/state.json.' \
   'Сторонний flush ruleset удалит правила: после него потребуется systemctl restart node-ip-split.' \
   'Архив network-backup.tar.gz может содержать сетевые секреты; не публикуйте его.'
