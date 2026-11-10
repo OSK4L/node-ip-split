@@ -535,7 +535,8 @@ for iface in addresses:
         if ipaddress.ip_address(ip).is_global: public.append(ip)
 if a not in found or b not in found: print('Оба IP должны быть уже назначены интерфейсам VPS; настройте дополнительный IP по документации хостера.')
 elif found[a]!=found[b]: print('IP находятся на разных интерфейсах.')
-if set(public)!={a,b}: print('Ожидаются ровно два публичных IPv4; остальные требуют отдельного анализа.')
+# Additional public addresses are allowed. Rules below target only the selected pair.
+(d/'other-public-ips').write_text(', '.join(sorted(set(public)-{a,b})))
 rules=json.loads((d/'rules.json').read_text())
 if len(rules)!=3 or {(r.get('priority'),str(r.get('table'))) for r in rules}!={(0,'local'),(32766,'main'),(32767,'default')}:
     print('Есть нестандартные policy routing rules; они не будут изменены.')
@@ -592,6 +593,10 @@ if [[ -s $BLOCKERS ]]; then
     die "Автонастройка не применяется. Аудит сохранён в $RUN. Секреты из архива не публикуйте."
 fi
 IFACE=$(cat "$RUN/interface")
+OTHER_PUBLIC_IPS=$(cat "$RUN/other-public-ips")
+if [[ -n $OTHER_PUBLIC_IPS ]]; then
+    printf 'Другие публичные IP остаются без изменений: %s\n' "$OTHER_PUBLIC_IPS"
+fi
 TUNNEL_PORTS=$(cat "$RUN/tunnel-ports")
 if [[ -n $TUNNEL_PORTS ]]; then printf 'UDP-порты туннелей исключены из смены IP: %s\n' "$TUNNEL_PORTS"; fi
 [[ ! -e /etc/node-ip-split && ! -e /etc/systemd/system/node-ip-split.service ]] || die 'Уже есть установка node-ip-split; сначала используйте её rollback.sh.'
