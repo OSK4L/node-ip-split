@@ -565,6 +565,23 @@ chains={}
 for item in nft.get('nftables',[]):
     if 'chain' in item:
         c=item['chain']; chains[(c['family'],c['table'],c['name'])]=c
+def is_warp_killswitch(r, chains):
+    """Allow only the observed passive WARP guard, never mark setters."""
+    if (r.get('family'), r.get('table'), r.get('chain')) != (
+            'inet', 'warp_native', 'warp_native_killswitch'):
+        return False
+    c = chains.get(('inet', 'warp_native', 'warp_native_killswitch'), {})
+    if c.get('type') != 'filter' or c.get('hook') != 'output' or c.get('policy') != 'accept':
+        return False
+    expr = [e for e in r.get('expr', []) if set(e) != {'counter'}]
+    if len(expr) != 3 or expr[-1] != {'drop': None}:
+        return False
+    expected = [
+        {'match': {'op': '==', 'left': {'meta': {'key': 'mark'}}, 'right': 51888}},
+        {'match': {'op': '!=', 'left': {'meta': {'key': 'oifname'}}, 'right': 'warp'}},
+    ]
+    return expr[:2] == expected
+
 for item in nft.get('nftables',[]):
     if 'rule' not in item: continue
     r=item['rule']; text=json.dumps(r.get('expr',[])).lower()
@@ -575,7 +592,8 @@ for item in nft.get('nftables',[]):
             if not (r['table']=='nat' and r['chain']=='POSTROUTING' and '"masquerade"' in text and ('docker0' in text or 'br-' in text)):
                 print('Есть сторонний NAT: '+r['table']+'/'+r['chain'])
     if any(x in text for x in ('"mark"','"tproxy"','"notrack"','"flow"','"queue"')):
-        print('Есть маркировка/особая обработка трафика: '+r['table']+'/'+r['chain'])
+        if not is_warp_killswitch(r, chains):
+            print('Есть маркировка/особая обработка трафика: '+r['table']+'/'+r['chain'])
     c=chains.get((r['family'],r['table'],r['chain']),{})
     if c.get('type')=='route': print('Есть route chain.')
 # Ensure supplied ports actually listen on entry/wildcard. No ownership guessed.
