@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Interactive IPv4 separation for simple Ubuntu/Debian Remnawave nodes.
+# Outbound-only IPv4 SNAT for Ubuntu/Debian Remnawave nodes; preserves input access.
 # Run ON THE VPS, through SSH. No passwords, DNS or panel configuration collected.
 # Unsupported layouts stop after audit; no attempt to guess provider networking.
 set -Eeuo pipefail
@@ -67,7 +67,8 @@ show_plan() {
     title 'Будет настроено'
     printf '  Входной IP:  %s — сюда подключаются клиенты\n' "$ENTRY"
     printf '  Выходной IP: %s — его должны видеть сайты\n' "$EXIT_IP"
-    printf '  VPN-порты: TCP [%s]  UDP [%s]\n' "${TCP_PORTS:--}" "${UDP_PORTS:--}"
+    printf '%s\n' '  Входные порты: без изменений; запреты входа не добавляются.'
+    printf '%s\n' '  WARP: отдельный выход, его внешний IP сохраняется.'
 }
 ports() {
     python3 - "$1" <<'PY'
@@ -483,30 +484,9 @@ if [[ $NODE != - ]]; then
         NODE_API_PORT=$((10#$detected_api))
     fi
 fi
+# Outbound-only mode: no input filtering and no VPN port selection.
 TCP_PORTS='' UDP_PORTS=''
-if [[ $NODE != - ]]; then
-    printf '%s\n' 'Укажите внешние порты VPN. Если UDP-входа нет, введите -.'
-    warn 'Если этот порт нужен сайту или панели на выходном IP, не применяйте ограничение.'
-    awk '$1 == "tcp" && /LISTEN/ {print "  TCP " $5}' "$RUN/listeners.txt"
-    printf 'Порт %s — управление нодой. Его закрывать не будем.\n' "$NODE_API_PORT"
-    while true; do
-        ask RAW_TCP 'TCP-порты VPN через запятую (обычно 443, либо -): '
-        ask RAW_UDP 'UDP-порты VPN через запятую (Enter — нет): '
-        if ! TCP_PORTS=$(ports "$RAW_TCP" 2>/dev/null); then warn 'TCP: нужны номера портов через запятую.'; continue; fi
-        if ! UDP_PORTS=$(ports "$RAW_UDP" 2>/dev/null); then warn 'UDP: нужны номера портов через запятую.'; continue; fi
-        bad_ports=0
-        for p in ${TCP_PORTS//,/ } ${UDP_PORTS//,/ }; do
-            if [[ $p == "$SSH_PORT" || $p == "$NODE_API_PORT" ]]; then
-                warn "Порт $p используется для SSH или управления нодой. Уберите его из списка."
-                bad_ports=1
-            fi
-        done
-        ((bad_ports == 0)) || continue
-        [[ -n $TCP_PORTS$UDP_PORTS ]] || { warn 'Укажите хотя бы один VPN-порт.'; continue; }
-        break
-    done
-    printf '%s\n' 'Ограничение входа касается только выбранных портов этой ноды. Другие VPN, включая Amnezia, отдельно не перенастраиваются.'
-fi
+printf '%s\n' 'Меняется только исходящий IPv4. Входные порты не ограничиваются.'
 
 # Strict eligibility gate. Any unexplained configuration is audit-only.
 BLOCKERS="$RUN/blockers.txt"
@@ -645,22 +625,15 @@ add rule ip node_ip_split outbound fib daddr type local return
 add rule ip node_ip_split outbound ct status dnat return
 add rule ip node_ip_split outbound ct mark != 0 return
 add rule ip node_ip_split outbound meta mark != 0 return
-add chain ip node_ip_split inbound { type filter hook input priority -10; policy accept; }
 EOF
 if [[ -n $TUNNEL_PORTS ]]; then
     echo "add rule ip node_ip_split outbound udp sport { $TUNNEL_PORTS } return" >> "$RUN/rules.nft"
 fi
 echo "add rule ip node_ip_split outbound oifname \"$IFACE\" ip saddr { $ENTRY, $EXIT_IP } ct direction original counter snat to $EXIT_IP" >> "$RUN/rules.nft"
-if [[ -n $TCP_PORTS ]]; then
-    echo "add rule ip node_ip_split inbound ip daddr $EXIT_IP ct state new tcp dport { $TCP_PORTS } counter reject with tcp reset" >> "$RUN/rules.nft"
-fi
-if [[ -n $UDP_PORTS ]]; then
-    echo "add rule ip node_ip_split inbound ip daddr $EXIT_IP ct state new udp dport { $UDP_PORTS } counter reject" >> "$RUN/rules.nft"
-fi
 nft -c -f "$RUN/rules.nft" || die 'Проверка nftables не пройдена.'
 title 'Шаг 3 из 3 — подтверждение'
 show_plan
-warn 'На выходном IP новые подключения к указанным VPN-портам будут закрыты.'
+ok 'Новые запреты входа не добавляются ни на один IP.'
 if [[ -n $TUNNEL_PORTS ]]; then printf 'Исключения для UDP-портов туннелей: %s\n' "$TUNNEL_PORTS"; fi
 printf '%s\n' 'Новые обычные соединения IPv4 пойдут через выходной IP.' \
   'Панель, DNS, IPv6 и сеть не перезапускаются. Старые соединения могут сохранить прежний IP.' \
@@ -706,7 +679,7 @@ EOF
 chmod 700 "$RUN/apply.sh"
 cat > "$RUN/node-ip-split.service" <<EOF
 [Unit]
-Description=IPv4 source separation and VPN entry restriction
+Description=IPv4 outbound source selection (no input filtering)
 Wants=network-online.target
 After=network-online.target nftables.service ufw.service docker.service
 ConditionPathExists=/etc/node-ip-split/committed
@@ -755,7 +728,7 @@ cat > "$RUN/result.txt" <<EOF
 Результат проверки исходящего IPv4 через HTTPS: $OBSERVED
 Новое SSH-подключение не запрашивалось и не проверялось.
 Автоматический откат отключён; правила сохраняются до ручного удаления.
-VPN TCP: $TCP_PORTS; UDP: $UDP_PORTS
+Входные порты не изменены: режим только исходящего SNAT.
 Созданы /etc/node-ip-split/{rules.nft,apply.sh,committed}
 Создан /etc/systemd/system/node-ip-split.service (enabled, active).
 Добавлена nft-таблица ip node_ip_split; исходные правила: nft.before.txt.
